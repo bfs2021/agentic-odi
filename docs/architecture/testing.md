@@ -70,7 +70,8 @@ Tests live next to their package (`packages/*/tests`, `apps/*/tests`). `testpath
 - `test_server_tools.py` — server-level tool registration and transport wiring.
 - `test_tool_spec_validation.py` — startup refuses a contract/registry mismatch.
 - `test_health.py` — the `get_health` tool reports accessible and degraded stores.
-- `conftest.py` — sets `AGENTIC_ODI_DB=:memory:` before the server imports.
+- `test_import_side_effects.py` — importing the server builds no store and creates no data directory.
+- `conftest.py` — calls `configure(InMemoryRepository())` per test; no import-order dependency.
 
 ### `apps/studio-api/tests/`
 

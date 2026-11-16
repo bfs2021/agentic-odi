@@ -29,6 +29,7 @@ from agentic_odi_core import (
     OutcomeNotFoundError,
     OutcomeStatementError,
     ProposalStatus,
+    Repository,
     ScheduledWorkNotFoundError,
     SignalNotFoundError,
     StepNotFoundError,
@@ -113,8 +114,37 @@ class _AuthMiddleware:
         await self.app(scope, receive, send)
 
 
-_repo = build_repository()
-service = ODIService(_repo)
+#: The composition root. Importing this module must not build a store, touch
+#: the filesystem, or freeze a configuration choice: ``configure()`` does that
+#: explicitly, the way ``create_app(repo=...)`` does in the sidecar.
+_repo: Repository | None = None
+_service: ODIService | None = None
+
+
+def configure(repo: Repository | None = None) -> ODIService:
+    """Bind this process to one store and return its service.
+
+    Omitting ``repo`` builds the configured repository (SQLite, or in-memory
+    for ``AGENTIC_ODI_DB=:memory:``). Passing one is how a test names its store
+    without import-order gymnastics.
+    """
+    global _repo, _service
+    _repo = build_repository() if repo is None else repo
+    _service = ODIService(_repo)
+    return _service
+
+
+def get_repository() -> Repository:
+    if _repo is None:
+        raise RuntimeError("MCP server is not configured; call configure() first")
+    return _repo
+
+
+def get_service() -> ODIService:
+    if _service is None:
+        raise RuntimeError("MCP server is not configured; call configure() first")
+    return _service
+
 
 _shutdown_complete = False
 
@@ -125,10 +155,11 @@ def shutdown_store() -> None:
     if _shutdown_complete:
         return
     _shutdown_complete = True
+    repo = get_repository()
     try:
-        _repo.commit()
+        repo.commit()
     finally:
-        _repo.close()
+        repo.close()
 
 
 @asynccontextmanager
@@ -140,15 +171,6 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
 
 
 mcp = FastMCP("Agentic ODI", lifespan=_lifespan)
-
-jobs_db = _repo.jobs
-steps_db = _repo.steps
-outcomes_db = _repo.outcomes
-customer_outcomes_db = _repo.customer_outcomes
-evidence_db = _repo.evidence
-signals_db = _repo.signals
-segments_db = _repo.segments
-strategies_db = _repo.strategies
 
 
 def _fail(exc: BaseException, sentence: str | None = None) -> str:
@@ -189,7 +211,7 @@ def odi_assistant_prompt() -> str:
 
 @mcp.tool
 def add_job(name: str, description: str | None = None) -> str:
-    job = service.add_job(name=name, description=description)
+    job = get_service().add_job(name=name, description=description)
     return f"Job created successfully: {job.model_dump_json()}"
 
 
@@ -200,13 +222,13 @@ def get_jobs(limit: int | None = None, offset: int = 0) -> str:
     ``limit`` caps how many jobs are returned and ``offset`` skips that many
     first, so a client can walk a long list without re-reading all of it.
     """
-    jobs = service.get_jobs(limit=limit, offset=offset)
+    jobs = get_service().get_jobs(limit=limit, offset=offset)
     return json.dumps([job.model_dump() for job in jobs])
 
 
 @mcp.tool
 def get_job(job_id: str) -> str:
-    job = service.get_job(job_id)
+    job = get_service().get_job(job_id)
     if job is None:
         return _fail(JobNotFoundError(job_id), f"Error: Job with ID {job_id} not found.")
     return job.model_dump_json()
@@ -221,7 +243,7 @@ def add_step(
     allow_empty_job_map: bool = False,
 ) -> str:
     try:
-        step = service.add_step(
+        step = get_service().add_step(
             job_id=job_id,
             name=name,
             order=order,
@@ -239,10 +261,10 @@ def add_step(
 
 @mcp.tool
 def get_job_map(job_id: str, limit: int | None = None, offset: int = 0) -> str:
-    job = service.get_job(job_id)
+    job = get_service().get_job(job_id)
     if job is None:
         return _fail(JobNotFoundError(job_id), f"Error: Job with ID {job_id} not found.")
-    steps = service.get_job_map(job_id, limit=limit, offset=offset)
+    steps = get_service().get_job_map(job_id, limit=limit, offset=offset)
     return json.dumps([step.model_dump() for step in steps])
 
 
@@ -279,7 +301,7 @@ def add_outcome(
     text must match an entry the vision holds now; an unknown one is refused with
     the entries that do exist. Omit it (or pass ``[]``) for an unlinked outcome.
     """
-    if service.get_job(job_id) is None:
+    if get_service().get_job(job_id) is None:
         return _fail(JobNotFoundError(job_id), f"Error: Job with ID {job_id} not found.")
     for score, name in ((importance, "importance"), (satisfaction, "satisfaction")):
         if score is not None and not (1.0 <= score <= 10.0):
@@ -298,7 +320,7 @@ def add_outcome(
             )
         )
     try:
-        outcome = service.add_outcome(
+        outcome = get_service().add_outcome(
             job_id=job_id,
             statement=statement,
             importance=importance,
@@ -330,10 +352,10 @@ def get_outcomes(
     offset: int = 0,
     sort: str = "opportunity_score",
 ) -> str:
-    job = service.get_job(job_id)
+    job = get_service().get_job(job_id)
     if job is None:
         return _fail(JobNotFoundError(job_id), f"Error: Job with ID {job_id} not found.")
-    outcomes = service.get_outcomes(
+    outcomes = get_service().get_outcomes(
         job_id=job_id, step_id=step_id, limit=limit, offset=offset, sort=sort
     )
     return json.dumps([outcome.model_dump() for outcome in outcomes])
@@ -347,7 +369,7 @@ def add_customer_outcome(
     step_id: str | None = None,
 ) -> str:
     try:
-        co = service.add_customer_outcome(
+        co = get_service().add_customer_outcome(
             job_id=job_id,
             customer_value=customer_value,
             business_value=business_value,
@@ -365,7 +387,7 @@ def add_customer_outcome(
 @mcp.tool
 def get_customer_outcome(outcome_id: str) -> str:
     try:
-        co = service.get_customer_outcome(outcome_id)
+        co = get_service().get_customer_outcome(outcome_id)
     except CustomerOutcomeNotFoundError:
         return _fail(CustomerOutcomeNotFoundError(outcome_id), _cust_not_found(outcome_id))
     return co.model_dump_json()
@@ -376,7 +398,7 @@ def list_customer_outcomes(
     job_id: str | None = None, limit: int | None = None, offset: int = 0
 ) -> str:
     """List customer outcomes, optionally for one job and one page at a time."""
-    outcomes = service.list_customer_outcomes(job_id=job_id, limit=limit, offset=offset)
+    outcomes = get_service().list_customer_outcomes(job_id=job_id, limit=limit, offset=offset)
     return json.dumps([o.model_dump() for o in outcomes])
 
 
@@ -399,7 +421,7 @@ def update_customer_outcome(
     value_metrics: list[dict] | None = None,
 ) -> str:
     try:
-        co = service.get_customer_outcome(outcome_id)
+        co = get_service().get_customer_outcome(outcome_id)
     except CustomerOutcomeNotFoundError:
         return _fail(CustomerOutcomeNotFoundError(outcome_id), _cust_not_found(outcome_id))
     updates: dict[str, Any] = {}
@@ -436,7 +458,7 @@ def update_customer_outcome(
     if step_id is not None:
         updates["step_id"] = step_id
     try:
-        co2 = service.update_customer_outcome(outcome_id, updates)
+        co2 = get_service().update_customer_outcome(outcome_id, updates)
     except CustomerOutcomeNotFoundError:
         return _fail(CustomerOutcomeNotFoundError(outcome_id), _cust_not_found(outcome_id))
     except ValidationError as e:
@@ -447,7 +469,7 @@ def update_customer_outcome(
 @mcp.tool
 def delete_customer_outcome(outcome_id: str) -> str:
     try:
-        service.delete_customer_outcome(outcome_id)
+        get_service().delete_customer_outcome(outcome_id)
     except CustomerOutcomeNotFoundError:
         return _fail(CustomerOutcomeNotFoundError(outcome_id), _cust_not_found(outcome_id))
     return f"Customer outcome deleted successfully: {outcome_id}"
@@ -481,14 +503,14 @@ def get_capabilities_manifest() -> str:
 @mcp.tool
 def get_health() -> str:
     """Report whether the ODI store can be queried right now."""
-    if _repo.health():
+    if get_repository().health():
         return json.dumps({"status": "ok", "store": "accessible"})
     return json.dumps({"status": "degraded", "store": "locked"})
 
 
 @mcp.tool
 def get_step(step_id: str) -> str:
-    step = service.get_step(step_id)
+    step = get_service().get_step(step_id)
     if step is None:
         return _step_not_found(step_id)
     return step.model_dump_json()
@@ -496,7 +518,7 @@ def get_step(step_id: str) -> str:
 
 @mcp.tool
 def get_outcome(outcome_id: str) -> str:
-    outcome = service.get_outcome(outcome_id)
+    outcome = get_service().get_outcome(outcome_id)
     if outcome is None:
         return _outcome_not_found(outcome_id)
     return outcome.model_dump_json()
@@ -510,7 +532,7 @@ def update_job(job_id: str, name: str | None = None, description: str | None = N
     if description is not None:
         updates["description"] = description
     try:
-        job = service.update_job(job_id, updates)
+        job = get_service().update_job(job_id, updates)
     except JobNotFoundError:
         return _fail(JobNotFoundError(job_id), job_not_found(job_id))
     return f"Job updated successfully: {job.model_dump_json()}"
@@ -519,7 +541,7 @@ def update_job(job_id: str, name: str | None = None, description: str | None = N
 @mcp.tool
 def delete_job(job_id: str) -> str:
     try:
-        service.delete_job(job_id)
+        get_service().delete_job(job_id)
     except JobNotFoundError:
         return _fail(JobNotFoundError(job_id), job_not_found(job_id))
     return f"Job deleted successfully: {job_id}"
@@ -533,7 +555,7 @@ def update_step(step_id: str, name: str | None = None, order: int | None = None)
     if order is not None:
         updates["order"] = order
     try:
-        step = service.update_step(step_id, updates)
+        step = get_service().update_step(step_id, updates)
     except StepNotFoundError:
         return _step_not_found(step_id)
     return f"Step updated successfully: {step.model_dump_json()}"
@@ -542,7 +564,7 @@ def update_step(step_id: str, name: str | None = None, order: int | None = None)
 @mcp.tool
 def delete_step(step_id: str) -> str:
     try:
-        service.delete_step(step_id)
+        get_service().delete_step(step_id)
     except StepNotFoundError:
         return _step_not_found(step_id)
     return f"Step deleted successfully: {step_id}"
@@ -569,7 +591,7 @@ def update_outcome(
     if objectives is not None:
         updates["objectives"] = objectives
     try:
-        updated = service.update_outcome(outcome_id, updates)
+        updated = get_service().update_outcome(outcome_id, updates)
     except OutcomeNotFoundError:
         return _outcome_not_found(outcome_id)
     except OutcomeStatementError as exc:
@@ -584,7 +606,7 @@ def update_outcome(
 @mcp.tool
 def delete_outcome(outcome_id: str) -> str:
     try:
-        service.delete_outcome(outcome_id)
+        get_service().delete_outcome(outcome_id)
     except OutcomeNotFoundError:
         return _outcome_not_found(outcome_id)
     return f"Outcome deleted successfully: {outcome_id}"
@@ -611,7 +633,7 @@ async def add_evidence(
 ) -> str:
     await ctx.report_progress(0, 2, "Validating the evidence links")
     try:
-        evidence = service.add_evidence(
+        evidence = get_service().add_evidence(
             source_name=source_name,
             source_kind=source_kind,
             item_type=item_type,
@@ -639,7 +661,7 @@ async def add_evidence(
 
 @mcp.tool
 def get_evidence(evidence_id: str) -> str:
-    evidence = service.get_evidence(evidence_id)
+    evidence = get_service().get_evidence(evidence_id)
     if evidence is None:
         return _evidence_not_found(
             evidence_id,
@@ -657,7 +679,7 @@ def list_evidence(
     offset: int = 0,
 ) -> str:
     """List evidence for a job, step or outcome, one page at a time."""
-    items = service.list_evidence(
+    items = get_service().list_evidence(
         job_id=job_id, step_id=step_id, outcome_id=outcome_id, limit=limit, offset=offset
     )
     return json.dumps([item.model_dump() for item in items])
@@ -666,7 +688,7 @@ def list_evidence(
 @mcp.tool
 def delete_evidence(evidence_id: str) -> str:
     try:
-        service.delete_evidence(evidence_id)
+        get_service().delete_evidence(evidence_id)
     except EvidenceNotFoundError as exc:
         return _evidence_not_found(evidence_id, exc.hint)
     return f"Evidence deleted successfully: {evidence_id}"
@@ -684,7 +706,7 @@ def promote_evidence(
     force: bool = False,
 ) -> str:
     try:
-        artifact = service.promote_evidence(
+        artifact = get_service().promote_evidence(
             evidence_id,
             target,
             job_id=job_id,
@@ -715,7 +737,7 @@ async def evaluate_outcome(ctx: Context, statement: str, job_id: str | None = No
     await ctx.report_progress(0, 2, "Evaluating the statement")
     result = evaluate_outcome_statement(statement)
     if job_id is not None:
-        if service.get_job(job_id) is None:
+        if get_service().get_job(job_id) is None:
             return _fail(JobNotFoundError(job_id), job_not_found(job_id))
         result["job_id"] = job_id
         result["existing_outcomes"] = [
@@ -724,7 +746,7 @@ async def evaluate_outcome(ctx: Context, statement: str, job_id: str | None = No
                 "statement": outcome.statement,
                 "opportunity_score": outcome.opportunity_score,
             }
-            for outcome in service.get_outcomes(job_id)
+            for outcome in get_service().get_outcomes(job_id)
         ]
     await ctx.report_progress(2, 2, "Evaluation complete")
     return json.dumps(result)
@@ -740,7 +762,7 @@ def schedule_work(
     job_id: str | None = None,
 ) -> str:
     try:
-        work = service.schedule_work(
+        work = get_service().schedule_work(
             name=name,
             schedule_expression=schedule_expression,
             agent_id=agent_id,
@@ -758,7 +780,7 @@ def schedule_work(
 @mcp.tool
 def get_scheduled_work(work_id: str) -> str:
     try:
-        work = service.get_scheduled_work(work_id)
+        work = get_service().get_scheduled_work(work_id)
     except ScheduledWorkNotFoundError:
         return _fail(ScheduledWorkNotFoundError(work_id), scheduled_work_not_found(work_id))
     return work.model_dump_json()
@@ -769,14 +791,14 @@ def list_scheduled_work(
     job_id: str | None = None,
     status: str | None = None,
 ) -> str:
-    items = service.list_scheduled_work(job_id=job_id, status=status)
+    items = get_service().list_scheduled_work(job_id=job_id, status=status)
     return json.dumps([item.model_dump() for item in items])
 
 
 @mcp.tool
 def cancel_scheduled_work(work_id: str) -> str:
     try:
-        work = service.cancel_scheduled_work(work_id)
+        work = get_service().cancel_scheduled_work(work_id)
     except ScheduledWorkNotFoundError:
         return _fail(ScheduledWorkNotFoundError(work_id), scheduled_work_not_found(work_id))
     return f"Scheduled work cancelled successfully: {work.model_dump_json()}"
@@ -785,7 +807,7 @@ def cancel_scheduled_work(work_id: str) -> str:
 @mcp.tool
 def trigger_scheduled_work(work_id: str) -> str:
     try:
-        work = service.trigger_scheduled_work(work_id)
+        work = get_service().trigger_scheduled_work(work_id)
     except ScheduledWorkNotFoundError:
         return _fail(ScheduledWorkNotFoundError(work_id), scheduled_work_not_found(work_id))
     return f"Scheduled work dispatched: {work.model_dump_json()}"
@@ -799,14 +821,14 @@ def get_odi_schema() -> str:
 @mcp.tool
 def list_signals(unread_only: bool = False, limit: int = 50) -> str:
     """List recorded signals, newest first; ``unread_only`` trims to the badge."""
-    signals = service.list_signals(unread_only=unread_only, limit=limit)
+    signals = get_service().list_signals(unread_only=unread_only, limit=limit)
     return json.dumps([signal.model_dump(mode="json") for signal in signals])
 
 
 @mcp.tool
 def mark_signal_read(signal_id: str) -> str:
     try:
-        signal = service.mark_signal_read(signal_id)
+        signal = get_service().mark_signal_read(signal_id)
     except SignalNotFoundError:
         return _fail(
             SignalNotFoundError(signal_id), f"Error: Signal with ID {signal_id} not found."
@@ -817,7 +839,7 @@ def mark_signal_read(signal_id: str) -> str:
 @mcp.tool
 def dismiss_signal(signal_id: str) -> str:
     try:
-        signal = service.dismiss_signal(signal_id)
+        signal = get_service().dismiss_signal(signal_id)
     except SignalNotFoundError:
         return _fail(
             SignalNotFoundError(signal_id), f"Error: Signal with ID {signal_id} not found."
@@ -835,7 +857,7 @@ def segment_market(job_id: str | None = None, people: str | None = None) -> str:
     Re-running updates the same segment rather than adding a second copy.
     """
     try:
-        segments = service.segment_market(job_id=job_id, people=people)
+        segments = get_service().segment_market(job_id=job_id, people=people)
     except JobNotFoundError:
         return _fail(JobNotFoundError(job_id or ""), job_not_found(job_id or ""))
     return json.dumps([segment.model_dump(mode="json") for segment in segments])
@@ -848,7 +870,7 @@ def get_segments(job_id: str | None = None) -> str:
     Empty until ``segment_market`` has run: a segment is derived from evidence,
     never typed in.
     """
-    segments = service.list_segments(job_id=job_id)
+    segments = get_service().list_segments(job_id=job_id)
     return json.dumps([segment.model_dump(mode="json") for segment in segments])
 
 
@@ -860,7 +882,9 @@ def open_study(job_id: str, name: str, wave: int, method_notes: str | None = Non
     so an accidental re-run is refused while a deliberate later wave is allowed.
     """
     try:
-        study = service.open_study(job_id=job_id, name=name, wave=wave, method_notes=method_notes)
+        study = get_service().open_study(
+            job_id=job_id, name=name, wave=wave, method_notes=method_notes
+        )
     except JobNotFoundError:
         return _fail(JobNotFoundError(job_id), job_not_found(job_id))
     except OdiError as exc:
@@ -874,14 +898,14 @@ def list_studies(job_id: str | None = None) -> str:
 
     Empty until ``open_study`` has run: a study is opened, never typed in.
     """
-    studies = service.list_studies(job_id=job_id)
+    studies = get_service().list_studies(job_id=job_id)
     return json.dumps([study.model_dump(mode="json") for study in studies])
 
 
 @mcp.tool
 def get_strategy() -> str:
     """The latest recorded strategy, or ``null`` when Stage 6 has not run."""
-    strategy = service.get_strategy()
+    strategy = get_service().get_strategy()
     if strategy is None:
         return "null"
     return json.dumps(strategy.model_dump(mode="json"))
@@ -895,7 +919,7 @@ def propose_strategy(job_id: str | None = None) -> str:
     evidence behind it this refuses rather than inventing a bet.
     """
     try:
-        strategy = service.propose_strategy(job_id=job_id)
+        strategy = get_service().propose_strategy(job_id=job_id)
     except JobNotFoundError:
         return _fail(JobNotFoundError(job_id or ""), job_not_found(job_id or ""))
     except OdiError as exc:
@@ -913,7 +937,7 @@ def propose_outcome(evidence_id: str) -> str:
     ODI store until the proposal is approved via approve_proposal.
     """
     try:
-        proposal = service.propose_outcome_from_evidence(evidence_id)
+        proposal = get_service().propose_outcome_from_evidence(evidence_id)
     except EvidenceNotFoundError:
         return _fail(
             EvidenceNotFoundError(evidence_id), f"Error: evidence {evidence_id} not found."
@@ -936,7 +960,7 @@ def list_proposals(status: str | None = None) -> str:
         return _fail(
             exc, f"Error: invalid status '{status}'. Use proposed, approved, rejected, or edited."
         )
-    proposals = service.list_proposals(status=proposal_status)
+    proposals = get_service().list_proposals(status=proposal_status)
     return json.dumps([p.model_dump(mode="json") for p in proposals])
 
 
@@ -953,7 +977,7 @@ def approve_proposal(
     Importance/satisfaction default to the proposal's suggested values.
     """
     try:
-        outcome = service.approve_proposal(
+        outcome = get_service().approve_proposal(
             proposal_id, statement=statement, importance=importance, satisfaction=satisfaction
         )
     except ValidationError as exc:
@@ -967,7 +991,7 @@ def approve_proposal(
 def reject_proposal(proposal_id: str) -> str:
     """Reject a proposal. Nothing is written to the ODI store."""
     try:
-        proposal = service.reject_proposal(proposal_id)
+        proposal = get_service().reject_proposal(proposal_id)
     except ValidationError as exc:
         return _fail(exc)
     return json.dumps(proposal.model_dump(mode="json"))
@@ -982,7 +1006,7 @@ def link_outcome(outcome_id: str, field: str, text: str) -> str:
     exist, never guessed or fuzzy-matched.
     """
     try:
-        outcome = service.link_outcome(outcome_id, field, text)
+        outcome = get_service().link_outcome(outcome_id, field, text)
     except OutcomeNotFoundError as exc:
         return _fail(exc, f"Error: Outcome {outcome_id} not found.")
     except OdiValidationError as exc:
@@ -998,7 +1022,7 @@ def unlink_outcome(outcome_id: str, field: str, key: str) -> str:
     that is not there changes nothing.
     """
     try:
-        outcome = service.unlink_outcome(outcome_id, field, key)
+        outcome = get_service().unlink_outcome(outcome_id, field, key)
     except OutcomeNotFoundError as exc:
         return _fail(exc, f"Error: Outcome {outcome_id} not found.")
     return json.dumps(outcome.model_dump(mode="json"))
@@ -1051,7 +1075,7 @@ def links_remove(link_id: str) -> str:
 @mcp.tool
 def get_outcome_alignments(outcome_id: str | None = None) -> str:
     """List the V2MOM links recorded on Outcomes, optionally for one outcome."""
-    return json.dumps(service.list_alignments(outcome_id))
+    return json.dumps(get_service().list_alignments(outcome_id))
 
 
 @mcp.tool
@@ -1063,7 +1087,7 @@ def get_traceability_report() -> str:
     text is no longer in the vision. Read-only, and with no objectives defined
     it says so rather than returning three empty sections.
     """
-    return json.dumps(service.traceability_report().as_dict())
+    return json.dumps(get_service().traceability_report().as_dict())
 
 
 DEFAULT_PORT = 8000
@@ -1152,6 +1176,7 @@ def main(argv: list[str] | None = None) -> None:
         help=f"Port to listen on (default: $AGENTIC_ODI_MCP_PORT or {DEFAULT_PORT}).",
     )
     args = parser.parse_args(argv)
+    configure()
     validate_at_startup()
     setup_graceful_shutdown()
     # Gate only a token a studio has already minted. Minting one here would 401
