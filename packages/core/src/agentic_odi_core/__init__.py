@@ -20,6 +20,7 @@ from agentic_odi_core.contract import (
 )
 from agentic_odi_core.errors import (
     AlreadyPromotedError,
+    ConfigurationError,
     ConflictError,
     NotFoundError,
     OdiError,
@@ -225,6 +226,7 @@ __all__ = [
     "LINK_RELATIONSHIP_TYPES",
     "LocalOpenAIEngine",
     "RateLimitError",
+    "ConfigurationError",
     "RoutingMode",
     "SerializationError",
     "Step",
